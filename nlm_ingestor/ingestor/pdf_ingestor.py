@@ -2,8 +2,9 @@ import json
 import logging
 import re
 from collections import defaultdict, namedtuple
+from dataclasses import dataclass, field
 from timeit import default_timer
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -24,6 +25,20 @@ logger.setLevel(logging.INFO)
 text_only_pattern = re.compile(r"[^a-zA-Z]+")
 
 
+@dataclass
+class ParseResult:
+    """Structured return value from parse_blocks; replaces the legacy 7-tuple."""
+
+    blocks: list
+    block_texts: list
+    sents: list
+    file_data: list
+    result: list
+    page_dim: list
+    num_pages: int
+    parsed_doc: Any = None
+
+
 class PDFIngestor:
     def __init__(self, doc_location, parse_options):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -40,28 +55,31 @@ class PDFIngestor:
 
         tika_html_doc = parse_pdf(doc_location, parse_options)
         # print("tika_html_doc", tika_html_doc)
-        blocks, _block_texts, _sents, _file_data, result, page_dim, num_pages = (
-            parse_blocks(
-                tika_html_doc,
-                render_format=render_format,
-                parse_pages=parse_pages,
-                use_new_indent_parser=use_new_indent_parser,
-            )
+        parsed = parse_blocks(
+            tika_html_doc,
+            render_format=render_format,
+            parse_pages=parse_pages,
+            use_new_indent_parser=use_new_indent_parser,
         )
         print("parsed blocks")
         return_dict = {
-            "page_dim": page_dim,
-            "num_pages": num_pages,
+            "page_dim": parsed.page_dim,
+            "num_pages": parsed.num_pages,
         }
         if render_format == "json":
-            return_dict["result"] = result[0].get("document", {})
-            self.doc_result_json = result[0]
+            return_dict["result"] = parsed.result[0].get("document", {})
+            self.doc_result_json = parsed.result[0]
         elif render_format == "all":
-            return_dict["result"] = result[1].get("document", {})
-            self.doc_result_json = result[1]
+            return_dict["result"] = parsed.result[1].get("document", {})
+            self.doc_result_json = parsed.result[1]
+        elif render_format in ("markdown", "markdown_chunks_by_page", "markdown_chunks_by_section"):
+            return_dict["result"] = _render_markdown_for_pdf(
+                parsed, render_format
+            )
         self.return_dict = return_dict
-        self.file_data = _file_data
-        self.blocks = blocks
+        self.file_data = parsed.file_data
+        self.blocks = parsed.blocks
+        self.parsed_doc = parsed.parsed_doc
 
 
 def parse_pdf(doc_location, parse_options):
@@ -213,6 +231,7 @@ def parse_blocks(
             }
         ]
     else:
+        # "all" plus markdown variants reuse the html+json pair as input.
         result = [
             {
                 "title": title,
@@ -228,15 +247,43 @@ def parse_blocks(
 
     file_data = [json.dumps(res, cls=NpEncoder) for res in result]
 
-    return (
-        blocks,
-        block_texts,
-        sents,
-        file_data,
-        result,
-        [parsed_doc.page_width, parsed_doc.page_height],
-        len(pages) - 1,
+    return ParseResult(
+        blocks=blocks,
+        block_texts=block_texts,
+        sents=sents,
+        file_data=file_data,
+        result=result,
+        page_dim=[parsed_doc.page_width, parsed_doc.page_height],
+        num_pages=len(pages) - 1,
+        parsed_doc=parsed_doc,
     )
+
+
+def _render_markdown_for_pdf(parsed: ParseResult, render_format: str):
+    """Map a markdown-family render_format to the BlockRenderer call."""
+    from nlm_ingestor.ingestor.visual_ingestor.block_renderer import (
+        BlockRenderer,
+        MarkdownOptions,
+    )
+
+    chunk_by = {
+        "markdown": None,
+        "markdown_chunks_by_page": "page",
+        "markdown_chunks_by_section": "section",
+    }[render_format]
+
+    title_info = parsed.result[0] if parsed.result else {}
+    title = title_info.get("title")
+    title_page_fonts = title_info.get("title_page_fonts", {})
+
+    opts = MarkdownOptions(
+        title=title,
+        num_pages=parsed.num_pages + 1 if parsed.num_pages is not None else None,
+        title_page_fonts=title_page_fonts,
+        chunk_by=chunk_by,
+    )
+    br = BlockRenderer(parsed.parsed_doc)
+    return br.render_markdown(opts)
 
 
 def top_pages_info(parsed_doc):
